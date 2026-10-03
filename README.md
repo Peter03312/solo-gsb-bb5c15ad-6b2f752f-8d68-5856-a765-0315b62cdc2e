@@ -33,6 +33,16 @@
 含这些批次的**已确认核验单转待复核**，历次确认快照保持原样。未知批次或目标线、
 已作废批次、目标线与原线相同均整体拒绝，失败不留下部分归属或裁决版本。
 
+同一原料批号被**误登记成两个编号**时，工作人员可凭**源批号、目标批号与非空原因**
+并档（`POST /api/material-lots/merge`）。两号须**已登记且仍可使用**；目标号保留
+自身名称、过敏原及**待检锁定状态**，源号**留档可查**，但不再接受**新批次引用、
+更正或锁定操作**。已有**有效批次**对源号的**直接用料改指目标号**，原本同时引用
+两号的批次**去重**；**已作废批次**与历史裁决、确认、交接、退回记录**不改写**。
+受影响产线**从最早引用批次起顺序重算并追加裁决版本**（trigger=`MERGE_LOT`），
+直接用料的**出货资格按目标号当前锁定状态更新**（版本强制递增），相关**已确认核验单
+随版本变化转待复核**；**已发运批次仍按原交接追溯**。相同编号、未知或已停用批号、
+空原因均**整体拒绝**，不留下部分引用或版本变更。
+
 **出货前装运批次发生变化**时，工作人员可凭**所见单据修订号**为草稿或待复核核验单
 提交一份**完整、有序的新批次清单**（`POST /api/verifications/{no}/revise`）。保存时
 在**同一事务内逐批重取当前裁决与出货资格快照**，单据回到**草稿**并**推进修订号**；
@@ -182,6 +192,56 @@
 | 更正已作废批次的归属 | 409 | `BATCH_VOIDED` |
 | 目标线与原产线相同 | 409 | `SAME_SOURCE_TARGET_LINE` |
 | `target_line_id` 为空/纯空白或缺字段 | 400/422 | `INVALID_PAYLOAD` / FastAPI 校验 |
+
+### 原料批号并档（误登记双编号合并）
+
+同一原料批号在来料时被误登记成两个编号时，可凭**源批号（误登记号）、目标批号
+（保留号）与非空原因**并档（`POST /api/material-lots/merge`，请求体
+`{"source_lot_no","target_lot_no","reason"}`）：
+
+- **两号须已登记且仍可使用**：源号与目标号都必须存在且为 `ACTIVE`。并档成功后
+  目标号**保持 `ACTIVE` 并保留自身名称、过敏原与待检锁定状态**（目标号档案不做任何
+  改写）；源号置为 **`MERGED`（留档停用）**，记录 `merged_into`（目标号）、
+  `merged_reason`、`merged_at`，批号查询接口仍返回其完整档案与锁定状态。
+- **源号留档但停止一切新操作**：源号不能再被**新批次引用**（登记/更正用料均拒绝，
+  错误 `details` 回传 `merged_into` 保留号），不能再**更正原料档案**或**锁定/解除**；
+  GET 查询始终可用。已并档批号也不能再次作为源号或目标号参与并档（允许把当前目标号
+  再次并入第三个号，形成只追加的并档链）。
+- **有效批次用料改指 / 去重**：所有引用源号的**有效（ACTIVE）批次**，其直接用料
+  统一改指目标号（`batch.material_lots` 与用料关联表同步更新）；原本**同时引用两号**
+  的批次只保留一个目标号引用（**去重**，保序、其他批号不动）。
+- **已作废批次不改写**：作废批次的用料记录（含用料 JSON 与关联表）**保持源号原样**，
+  随作废记录冻结留档，并在并档响应的 `untouched_voided_batches` 中逐批列出。
+- **顺序重算、追加裁决版本**：每条受影响产线**从该线最早“用料改指”批次起**（不是
+  目标号在该线的最早引用——更早的既有引用用料未变、不重算），按有效批次顺序重算
+  残留/实际/未声明与 RELEASE/HOLD；被重算批次**各追加一个历史裁决版本**
+  （trigger=`MERGE_LOT`，**即使结论不变也追加**），历史版本之外的任何旧版本不改写。
+- **出货资格按目标号锁定状态更新**：每个用料改指批次的出货资格按目标号**当前**待检
+  锁定状态重算，**资格版本强制 +1**（trigger=`MERGE_LOT`，即使资格结论 SHIPPABLE/
+  BLOCKED 未翻转也递增）；目标号若处于锁定，改指批次即 BLOCKED 于目标号。
+- **核验单与交接**：含任一受影响批次（用料改指批次及其同线重算后续批次）的**已确认**
+  核验单立即转**待复核**，草稿/待复核单据不转态；**历次确认快照只追加保留、不改写**。
+  **已发运批次仍按原交接追溯**——交接主记录与逐批冻结快照不变，并档产生的新版本
+  按既有规则进入该交接的**发运后质量复核**事项。
+- **只追加并档记录**：每次成功并档写一条审计记录（源/目标号、原因、时间、逐批
+  改指/去重明细与未改写的作废批次），可通过 `GET /api/material-lot-merges`
+  （可 `?lot_no=` 按源号或目标号过滤）与 `GET /api/material-lot-merges/{id}` 查询。
+- **整体拒绝、不留部分改动**：源号与目标号相同 409、任一编号未登记 404、任一编号
+  已停用（已并档）409、空/纯空白原因 400——全部在同一 `BEGIN IMMEDIATE` 事务内校验并
+  回滚，不写入用料改指、批号状态、并档记录或任何裁决/出货资格版本。
+
+并档拒绝码：
+
+| 场景 | HTTP | error.code |
+| --- | --- | --- |
+| 源批号与目标批号相同 | 409 | `SAME_SOURCE_TARGET_LOT` |
+| 源号或目标号未登记 | 404 | `MATERIAL_LOT_NOT_FOUND` |
+| 源号或目标号已并档停用 | 409 | `MATERIAL_LOT_MERGED`（`details` 含 `merged_into`） |
+| 新批次/更正用料引用已并档批号 | 400 | `MATERIAL_LOT_MERGED`（`details[].merged_into` 指向保留号） |
+| 更正/锁定/解除已并档批号 | 409 | `MATERIAL_LOT_MERGED` |
+| 原因为空或纯空白 | 400 | `INVALID_PAYLOAD` |
+| 字段缺失/类型错误 | 422 | FastAPI 模型校验 |
+| 并档记录不存在 | 404 | `MATERIAL_LOT_MERGE_NOT_FOUND` |
 
 ### 装车交接（整单发运）
 
@@ -365,6 +425,11 @@ BASE_URL=http://127.0.0.1:8080 python examples/verification_demo.py
 python examples/lot_lock_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/lot_lock_demo.py
 
+# 原料批号并档端到端示例（双编号合并/有效批次改指去重/作废批不改写/顺序重算 MERGE_LOT/
+#   出货资格按目标号锁定更新/已确认与已发运单据联动/拒绝场景/并档记录查询）
+python examples/material_lot_merge_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/material_lot_merge_demo.py
+
 # 误登记批次作废端到端示例（作废保留/号不可复用/退出残留链重算/核验单联动/拒绝/幂等/查询标记）
 python examples/batch_void_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/batch_void_demo.py
@@ -456,6 +521,59 @@ BASE_URL=http://127.0.0.1:8080 python examples/shipment_review_demo.py
   ]
 }
 ```
+
+### 原料批号并档
+
+同一原料批号被误登记成两个编号时并档（请求体
+`{"source_lot_no","target_lot_no","reason"}`，原因必填非空）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/material-lots/merge` | **并档源号 -> 目标号**；源号留档停用（`MERGED`），有效批次用料改指/去重、按序重算追加 `MERGE_LOT` 裁决版本，出货资格按目标号锁定状态更新并递版，已确认核验单转待复核；整体拒绝不留部分改动 |
+| GET | `/api/material-lot-merges?lot_no=X` | 列出并档审计记录（只追加）；可按源号或目标号过滤，未知批号 404 |
+| GET | `/api/material-lot-merges/{merge_id}` | 查询单条并档记录（含逐批改指/去重与未改写作废批次明细），未知记录 404 |
+
+并档响应：
+
+```jsonc
+{
+  "merge_id": 1,
+  "merged_at": "2026-10-03T00:00:00+00:00",
+  "reason": "同一批全脂奶粉来料时误登记成两个编号",
+  "source_lot": {              // 源号：MERGED 留档，merged_into 指向保留号；GET 仍可查
+    "lot_no": "RM-MILK-DUP", "material": "全脂奶粉（误登记名）",
+    "allergens": ["milk"], "status": "MERGED", "usable": false, "merged": true,
+    "merged_into": "RM-MILK-001", "merged_reason": "...", "merged_at": "...",
+    "lock": { "locked": false, "status": "UNLOCKED", "version": 0, "...": "..." }
+  },
+  "target_lot": {              // 目标号：保留自身名称/过敏原/锁定状态，仍 ACTIVE
+    "lot_no": "RM-MILK-001", "status": "ACTIVE", "usable": true,
+    "lock": { "locked": true, "status": "LOCKED", "...": "..." }, "...": "..."
+  },
+  "changed_batches": [         // 有效批次用料改指明细（作废批次不在此列）
+    { "batch_no": "B002", "line_id": "L1", "seq": 2,
+      "operation": "REPOINTED",                  // REPOINTED=改指 / DEDUPLICATED=同时引用两号去重
+      "from_material_lots": ["RM-MILK-DUP"],
+      "to_material_lots": ["RM-MILK-001"] }
+  ],
+  "untouched_voided_batches": [ // 用料未改写的已作废批次（随作废记录冻结留档）
+    { "batch_no": "B009", "line_id": "L2", "seq": 1, "voided_reason": "...",
+      "reason": "已作废批次随作废记录冻结留档，用料不改写" }
+  ],
+  "recomputed": [ /* 受影响产线从最早改指批次起按序重算的裁决摘要（trigger=MERGE_LOT） */ ],
+  "shipment_eligibility": [     // 用料改指批次：按目标号当前锁定状态重算并强制递版
+    { "batch_no": "B002", "line_id": "L1", "seq": 2,
+      "version": 3, "status": "BLOCKED", "locked_lots": ["RM-MILK-001"] }
+  ],
+  "affected_verifications": [   // 受影响核验单（CONFIRMED 已转 PENDING_REVIEW）
+    { "verification_no": "SH-001", "status": "PENDING_REVIEW", "updated_at": "..." }
+  ]
+}
+```
+
+并档后原料批号查询（`GET /api/material-lots/{lot_no}` 与列表）对源号返回
+`status="MERGED"`、`usable=false`、`merged=true`、`merged_into` / `merged_reason` /
+`merged_at`；批次用料中的源号只出现在**已作废批次**（有效批次已全部改指）。
 
 ### 批次与裁决
 
@@ -1240,6 +1358,33 @@ curl -s http://127.0.0.1:8080/api/handovers/HO-001
 curl -s http://127.0.0.1:8080/api/handovers/HO-001/returns
 curl -s http://127.0.0.1:8080/api/returns
 curl -s http://127.0.0.1:8080/api/returns/RT-001
+
+# 34) 原料批号并档：同一原料被误登记成两个编号时，凭源号（停用）/目标号（保留）/非空原因合并。
+#     目标号保留自身名称/过敏原/待检锁定状态；有效批次直接用料改指目标号（同引两号去重）、
+#     受影响产线从最早改指批次起按序重算并追加 MERGE_LOT 版本；出货资格按目标号锁定状态
+#     更新并递版；已确认核验单转待复核；已作废批次与历史裁决/确认/交接/退回记录不改写
+curl -s -X POST http://127.0.0.1:8080/api/material-lots/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"source_lot_no":"RM-MILK-DUP","target_lot_no":"RM-MILK-001",
+       "reason":"同一批全脂奶粉来料时被误登记成两个编号，合并为正确保留号"}'
+
+# 35) 并档记录查询：全部 / 按源号或目标号过滤 / 单条（含改指去重与未改写作废批次明细）
+curl -s http://127.0.0.1:8080/api/material-lot-merges
+curl -s 'http://127.0.0.1:8080/api/material-lot-merges?lot_no=RM-MILK-DUP'
+curl -s http://127.0.0.1:8080/api/material-lot-merges/1
+
+# 36) 源号留档可查（status=MERGED, merged_into 指向保留号），但新引用/更正/锁定均拒绝；
+#     已作废批次用料仍保留源号，批次历史可查到 MERGE_LOT 新版本
+curl -s http://127.0.0.1:8080/api/material-lots/RM-MILK-DUP
+curl -s -X POST http://127.0.0.1:8080/api/material-lots/RM-MILK-DUP/lock \
+  -H 'Content-Type: application/json' -d '{"reason":"试图锁定已停用号"}'   # 409 MATERIAL_LOT_MERGED
+
+# 37) 拒绝：相同编号 409 SAME_SOURCE_TARGET_LOT；未知批号 404 MATERIAL_LOT_NOT_FOUND；
+#     已停用批号 409/引用停用号 400 MATERIAL_LOT_MERGED；空白原因 400 INVALID_PAYLOAD；
+#     均在同一事务整体回滚，不留下部分用料改指、批号状态或版本变更
+curl -s -X POST http://127.0.0.1:8080/api/material-lots/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"source_lot_no":"RM-MILK-001","target_lot_no":"RM-MILK-001","reason":"x"}'
 ```
 
 更多可运行示例见 [`examples/run_demo.py`](examples/run_demo.py)（包含完整的
@@ -1248,6 +1393,10 @@ curl -s http://127.0.0.1:8080/api/returns/RT-001
 （创建 → HOLD 拦截 → 确认 → 更正转待复核 → 重新核验 → 二次确认与历史快照）；
 原料批号待检锁定全流程示例见 [`examples/lot_lock_demo.py`](examples/lot_lock_demo.py)
 （锁定 → 出货资格版本递增 → 残留不连带 → 确认拦截 → 待复核 → 解除 → 重新核验 → 二次确认）；
+原料批号并档全流程示例见 [`examples/material_lot_merge_demo.py`](examples/material_lot_merge_demo.py)
+（拒绝场景 → 目标号锁定 → 并档改指/去重与作废批不改写 → MERGE_LOT 顺序重算与
+出货资格按目标号更新 → 已发运批次原交接追溯并发运后复核 → 源号停用拒绝新操作 →
+并档记录与批次历史查询）；
 误登记批次作废全流程示例见 [`examples/batch_void_demo.py`](examples/batch_void_demo.py)
 （作废保留 → 号不可复用/不得更正 → 退出残留链按序重算 → 已确认单据转待复核 →
 含作废批次单据拒绝重新核验/确认 → 重复作废幂等 → 查询标明状态）；

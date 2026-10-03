@@ -18,6 +18,7 @@ from .schemas import (
     LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
+    MaterialLotMergeIn,
     ShipmentReviewDecisionIn,
     VerificationIn,
     VerificationReviseIn,
@@ -31,10 +32,10 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         description=(
             "面向共用产线的生产批次过敏原换线放行：登记原料批号与批次、"
             "计算残留传递与未声明过敏原，给出放行/扣留裁决；支持更正重算与历史版本查询；"
-            "出货核验、整单装车交接与已交接批次退货（部分退回、新单核验后再发运）、"
-            "发运后质量复核。"
+            "原料批号并档、出货核验、整单装车交接与已交接批次退货（部分退回、"
+            "新单核验后再发运）、发运后质量复核。"
         ),
-        version="1.1.0",
+        version="1.2.0",
     )
 
     store = Store(db_path or config.DB_PATH)
@@ -103,6 +104,36 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def get_material_lot_lock(lot_no: str, service: Service = Depends(svc)):
         """查询批号当前锁定状态与历次锁定/解除变更。"""
         return service.get_material_lot_lock(lot_no)
+
+    # ---------------- 原料批号并档 ----------------
+
+    @app.post("/api/material-lots/merge", tags=["原料批号并档"])
+    def merge_material_lots(body: MaterialLotMergeIn, service: Service = Depends(svc)):
+        """同一原料批号被误登记成两个编号时并档（源号 -> 目标号，必须填写非空原因）。
+
+        两号须已登记且仍可使用（ACTIVE）；目标号保留自身名称、过敏原与待检锁定状态，
+        源号留档可查但不再接受新批次引用、更正或锁定。已有有效批次对源号的直接用料
+        改指目标号（同时引用两号的批次去重），已作废批次与历史裁决、确认、交接、退回
+        记录不改写。受影响产线从最早引用批次起按序重算并追加 MERGE_LOT 裁决版本，
+        改指批次的出货资格按目标号当前锁定状态更新并递出版本，含这些批次的已确认
+        核验单转待复核；已发运批次仍按原交接追溯。相同编号、未知或已停用批号、空原因
+        均整体拒绝，不留下部分引用或版本变更。
+        """
+        return service.merge_material_lots(
+            body.source_lot_no, body.target_lot_no, body.reason
+        )
+
+    @app.get("/api/material-lot-merges", tags=["原料批号并档"])
+    def list_material_lot_merges(
+        lot_no: str | None = None, service: Service = Depends(svc)
+    ):
+        """列出原料批号并档记录（只追加）；可通过 ?lot_no= 按源号或目标号过滤。"""
+        return service.list_material_lot_merges(lot_no)
+
+    @app.get("/api/material-lot-merges/{merge_id}", tags=["原料批号并档"])
+    def get_material_lot_merge(merge_id: int, service: Service = Depends(svc)):
+        """查询单条原料批号并档记录（含用料改指/去重与未改写的已作废批次明细）。"""
+        return service.get_material_lot_merge(merge_id)
 
     # ---------------- 产线 ----------------
 

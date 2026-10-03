@@ -21,10 +21,16 @@ CREATE TABLE IF NOT EXISTS allergen (
 );
 
 CREATE TABLE IF NOT EXISTS material_lot (
-    lot_no      TEXT PRIMARY KEY,
-    material    TEXT NOT NULL,
-    allergens   TEXT NOT NULL DEFAULT '[]',  -- JSON 数组，过敏原代码
-    updated_at  TEXT NOT NULL
+    lot_no       TEXT PRIMARY KEY,
+    material     TEXT NOT NULL,
+    allergens    TEXT NOT NULL DEFAULT '[]',  -- JSON 数组，过敏原代码
+    -- 批号并档：ACTIVE=仍可使用（可登记/引用/更正/锁定）；
+    -- MERGED=已并档（留档可查，不再接受新批次引用、更正或锁定操作）
+    status       TEXT NOT NULL DEFAULT 'ACTIVE',
+    merged_into  TEXT,                          -- 并档时的目标保留批号（仅 MERGED 非空）
+    merged_reason TEXT,                         -- 并档原因（只写一次）
+    merged_at    TEXT,                          -- 并档时间
+    updated_at   TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS line (
@@ -81,6 +87,24 @@ CREATE TABLE IF NOT EXISTS material_lot_lock_version (
 CREATE INDEX IF NOT EXISTS idx_lot_version_lot
     ON material_lot_lock_version(lot_no, version);
 
+-- 原料批号并档（只追加审计）：同一原料批号被误登记成两个编号时，
+-- 源号并入目标号；目标号保留自身名称/过敏原/待检锁定状态，源号留档停用。
+-- 每次成功并档一条；源号被二次并档（并入第三个号）时再追加一条，形成并档链。
+CREATE TABLE IF NOT EXISTS material_lot_merge (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_lot_no   TEXT NOT NULL,             -- 源号（并档后停用）
+    target_lot_no   TEXT NOT NULL,             -- 目标号（保留并继续使用）
+    reason          TEXT NOT NULL,             -- 非空并档原因
+    changed_batches TEXT NOT NULL DEFAULT '[]', -- JSON：有效批次用料改指/去重明细
+    untouched_voided_batches TEXT NOT NULL DEFAULT '[]', -- JSON：用料未改写的已作废批次
+    merged_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lot_merge_source
+    ON material_lot_merge(source_lot_no, id);
+CREATE INDEX IF NOT EXISTS idx_lot_merge_target
+    ON material_lot_merge(target_lot_no, id);
+
 -- 每批“出货资格”当前快照：仅由该批直接使用的原料批号锁定状态决定，
 -- 不沿产线残留传递；批号锁定状态实际变化即递增（即便资格结论未翻转）
 CREATE TABLE IF NOT EXISTS shipment_eligibility (
@@ -100,7 +124,7 @@ CREATE TABLE IF NOT EXISTS shipment_eligibility_version (
     status      TEXT NOT NULL,
     locked_lots TEXT NOT NULL DEFAULT '[]',
     reasons     TEXT NOT NULL DEFAULT '[]',
-    trigger     TEXT NOT NULL,   -- REGISTER / LOT_LOCK / LOT_UNLOCK / CORRECT_BATCH / UPGRADE_INIT
+    trigger     TEXT NOT NULL,   -- REGISTER / LOT_LOCK / LOT_UNLOCK / CORRECT_BATCH / MERGE_LOT / UPGRADE_INIT
     changed_at  TEXT NOT NULL
 );
 
@@ -131,7 +155,7 @@ CREATE TABLE IF NOT EXISTS adjudication_version (
     disposition   TEXT NOT NULL,
     reasons       TEXT NOT NULL DEFAULT '[]',
     sources       TEXT NOT NULL DEFAULT '{}',
-    trigger       TEXT NOT NULL,                -- REGISTER / CORRECT_BATCH / CORRECT_LOT / VOID_BATCH / MOVE_BATCH（line_id/seq 为该版裁决当时的归属，换线不改写历史）
+    trigger       TEXT NOT NULL,                -- REGISTER / CORRECT_BATCH / CORRECT_LOT / VOID_BATCH / MERGE_LOT / MOVE_BATCH（line_id/seq 为该版裁决当时的归属，换线/并档不改写历史）
     decided_at    TEXT NOT NULL
 );
 
@@ -394,6 +418,10 @@ _MIGRATION_COLUMNS = [
     ("batch", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
     ("batch", "voided_reason", "TEXT"),
     ("batch", "voided_at", "TEXT"),
+    ("material_lot", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
+    ("material_lot", "merged_into", "TEXT"),
+    ("material_lot", "merged_reason", "TEXT"),
+    ("material_lot", "merged_at", "TEXT"),
     ("verification_batch", "snapshot_ship_version", "INTEGER"),
     ("verification_batch", "snapshot_ship_status", "TEXT"),
     ("verification_batch", "snapshot_locked_lots", "TEXT NOT NULL DEFAULT '[]'"),

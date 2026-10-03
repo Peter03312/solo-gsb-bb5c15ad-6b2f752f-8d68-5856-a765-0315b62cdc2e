@@ -37,6 +37,21 @@ class LotLockIn(BaseModel):
     reason: str = Field(..., description="锁定/解除原因（必填，不允许空白）；重复提交相同状态不产生新变更")
 
 
+class MaterialLotMergeIn(BaseModel):
+    source_lot_no: str = Field(
+        ...,
+        description="源原料批号：被误登记、并档后留档停用的编号（须已登记且仍可使用 ACTIVE）",
+    )
+    target_lot_no: str = Field(
+        ...,
+        description="目标原料批号：保留自身名称、过敏原与待检锁定状态的编号（须已登记且仍可使用 ACTIVE，且与源号不同）",
+    )
+    reason: str = Field(
+        ...,
+        description="并档原因（必填，不允许空白）；源号留档可查，不再接受新批次引用、更正或锁定",
+    )
+
+
 class BatchVoidIn(BaseModel):
     reason: str = Field(..., description="作废原因（必填，不允许空白）；作废保留登记与历史可查，批次号不可复用")
 
