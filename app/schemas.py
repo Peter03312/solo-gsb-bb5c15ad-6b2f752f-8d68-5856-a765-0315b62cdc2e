@@ -15,6 +15,17 @@ class MaterialLotCorrection(BaseModel):
     allergens: list[str] | None = Field(None, description="更正后的过敏原代码全集；不传表示不变")
 
 
+class MaterialLotMergeIn(BaseModel):
+    target_lot_no: str = Field(
+        ...,
+        description="并档目标批号（须已登记且仍可使用；保留其自身名称、过敏原与待检锁定状态）",
+    )
+    reason: str = Field(
+        ...,
+        description="并档原因（必填，不允许空白）；源批号留档可查，不再接受新批次引用、更正或锁定",
+    )
+
+
 class BatchIn(BaseModel):
     batch_no: str = Field(..., description="成品生产批次号（全局唯一）")
     line_id: str = Field(..., description="共用产线标识；首次出现时自动建档")

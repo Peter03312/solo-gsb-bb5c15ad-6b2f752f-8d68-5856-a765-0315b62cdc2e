@@ -21,11 +21,29 @@ CREATE TABLE IF NOT EXISTS allergen (
 );
 
 CREATE TABLE IF NOT EXISTS material_lot (
-    lot_no      TEXT PRIMARY KEY,
-    material    TEXT NOT NULL,
-    allergens   TEXT NOT NULL DEFAULT '[]',  -- JSON 数组，过敏原代码
-    updated_at  TEXT NOT NULL
+    lot_no         TEXT PRIMARY KEY,
+    material       TEXT NOT NULL,
+    allergens      TEXT NOT NULL DEFAULT '[]',  -- JSON 数组，过敏原代码
+    status         TEXT NOT NULL DEFAULT 'ACTIVE', -- ACTIVE=可使用 / MERGED=已并档停用（留档可查）
+    merged_into    TEXT,                          -- 并档目标批号（并档时非空，只追加不改）
+    merged_reason  TEXT,                          -- 并档原因
+    merged_at      TEXT,                          -- 并档时间
+    updated_at     TEXT NOT NULL
 );
+
+-- 原料批号并档：同一原料误登记成两个编号时，凭源批号、目标批号与非空原因
+-- 把源批号并入目标批号。记录只追加、不可变；目标批号保留自身名称/过敏原/锁定状态，
+-- 源批号留档可查（status=MERGED），不再接受新批次引用、更正或锁定操作。
+CREATE TABLE IF NOT EXISTS material_lot_merge (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_lot_no TEXT NOT NULL REFERENCES material_lot(lot_no),
+    target_lot_no TEXT NOT NULL REFERENCES material_lot(lot_no),
+    reason        TEXT NOT NULL,               -- 非空并档原因
+    merged_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_lot_merge_source ON material_lot_merge(source_lot_no);
+CREATE INDEX IF NOT EXISTS idx_lot_merge_target ON material_lot_merge(target_lot_no);
 
 CREATE TABLE IF NOT EXISTS line (
     line_id     TEXT PRIMARY KEY,
@@ -403,6 +421,10 @@ _MIGRATION_COLUMNS = [
     ("verification_confirmation_batch", "snapshot_locked_lots", "TEXT NOT NULL DEFAULT '[]'"),
     ("verification_confirmation_batch", "snapshot_ship_reasons", "TEXT NOT NULL DEFAULT '[]'"),
     ("verification", "revision", "INTEGER NOT NULL DEFAULT 1"),
+    ("material_lot", "status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
+    ("material_lot", "merged_into", "TEXT"),
+    ("material_lot", "merged_reason", "TEXT"),
+    ("material_lot", "merged_at", "TEXT"),
 ]
 
 

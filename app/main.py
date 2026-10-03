@@ -18,6 +18,7 @@ from .schemas import (
     LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
+    MaterialLotMergeIn,
     ShipmentReviewDecisionIn,
     VerificationIn,
     VerificationReviseIn,
@@ -31,10 +32,10 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
         description=(
             "面向共用产线的生产批次过敏原换线放行：登记原料批号与批次、"
             "计算残留传递与未声明过敏原，给出放行/扣留裁决；支持更正重算与历史版本查询；"
-            "出货核验、整单装车交接与已交接批次退货（部分退回、新单核验后再发运）、"
-            "发运后质量复核。"
+            "原料批号并档（误登记双编号合并）、出货核验、整单装车交接与已交接批次退货"
+            "（部分退回、新单核验后再发运）、发运后质量复核。"
         ),
-        version="1.1.0",
+        version="1.2.0",
     )
 
     store = Store(db_path or config.DB_PATH)
@@ -84,6 +85,27 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def correct_material_lot(lot_no: str, body: MaterialLotCorrection, service: Service = Depends(svc)):
         """更正原料批号（名称/过敏原），重算受影响批次及后续批次。"""
         return service.correct_material_lot(lot_no, body.material, body.allergens)
+
+    # ---------------- 原料批号并档 ----------------
+
+    @app.post("/api/material-lots/{lot_no}/merge", tags=["原料批号并档"], status_code=201)
+    def merge_material_lot(lot_no: str, body: MaterialLotMergeIn, service: Service = Depends(svc)):
+        """并档：同一原料误登记成两个编号时，凭源批号、目标批号与非空原因并档。
+
+        两号须已登记且仍可使用；目标批号保留自身名称、过敏原及待检锁定状态；
+        源批号留档可查，不再接受新批次引用、更正或锁定操作。已有有效批次对源号的
+        直接用料改指目标号（原本同时引用两号的批次去重）；已作废批次与历史裁决、
+        确认、交接、退回记录不改写。受影响产线从最早引用批次起顺序重算并追加
+        裁决版本（MERGE_LOT），直接用料的出货资格按目标号当前锁定状态更新，
+        相关已确认核验单随版本变化转待复核；已发运批次仍按原交接追溯。
+        相同编号、未知或已停用批号、空原因均整体拒绝，不留下部分引用或版本变更。
+        """
+        return service.merge_material_lot(lot_no, body.target_lot_no, body.reason)
+
+    @app.get("/api/material-lot-merges", tags=["原料批号并档"])
+    def list_material_lot_merges(service: Service = Depends(svc)):
+        """列出全部并档记录（只追加，按并档先后排序）。"""
+        return {"merges": service.list_material_lot_merges()}
 
     @app.post("/api/material-lots/{lot_no}/lock", tags=["原料批号待检锁定"])
     def lock_material_lot(lot_no: str, body: LotLockIn, service: Service = Depends(svc)):

@@ -54,6 +54,55 @@ def _normalize_str_list(values, field: str) -> list[str]:
     return list(dict.fromkeys(v.strip() for v in values))
 
 
+def _reject_unusable_lots(conn, lots: list[str]) -> None:
+    """登记/更正批次用料前校验：批号须已登记且仍可使用。
+
+    未登记批号 400 UNKNOWN_MATERIAL_LOT；已并档停用的批号留档可查，
+    但不再接受新批次引用（400 MATERIAL_LOT_MERGED，details 给出并档目标）。
+    """
+    if not lots:
+        return
+    placeholders = ",".join("?" * len(lots))
+    rows = conn.execute(
+        f"SELECT lot_no, status, merged_into FROM material_lot WHERE lot_no IN ({placeholders})",
+        lots,
+    ).fetchall()
+    by_no = {r["lot_no"]: r for r in rows}
+    unknown = [lot for lot in lots if lot not in by_no]
+    if unknown:
+        raise bad_request(
+            "UNKNOWN_MATERIAL_LOT", f"未知原料批号: {', '.join(unknown)}"
+        )
+    merged = [lot for lot in lots if by_no[lot]["status"] == "MERGED"]
+    if merged:
+        raise bad_request(
+            "MATERIAL_LOT_MERGED",
+            f"原料批号已并档停用，不再接受新批次引用: {', '.join(merged)}",
+            [
+                {
+                    "lot_no": lot,
+                    "reason_code": "MATERIAL_LOT_MERGED",
+                    "merged_into": by_no[lot]["merged_into"],
+                    "message": (
+                        f"批号 {lot} 已并入 {by_no[lot]['merged_into']}（留档可查），"
+                        "请改用并档目标批号"
+                    ),
+                }
+                for lot in merged
+            ],
+        )
+
+
+def _merge_lot_list(lots: list[str], source: str, target: str) -> list[str]:
+    """并档改指：用料清单中的源批号替换为目标批号；原本同时引用两号的去重（保序）。"""
+    merged: list[str] = []
+    for lot in lots:
+        replacement = target if lot == source else lot
+        if replacement not in merged:
+            merged.append(replacement)
+    return merged
+
+
 # ---------------------------------------------------------------- 裁决计算
 
 
@@ -722,6 +771,12 @@ class Service:
                 raise not_found(
                     "CORRECTION_TARGET_NOT_FOUND", f"更正目标不存在，原料批号: {lot_no}"
                 )
+            if row["status"] == "MERGED":
+                raise conflict(
+                    "MATERIAL_LOT_MERGED",
+                    f"原料批号已并档停用，不可更正: {lot_no}"
+                    f"（已并入 {row['merged_into']}；留档可查，不再接受更正操作）",
+                )
 
             new_material = (material or row["material"]).strip()
             old_allergens = loads(row["allergens"])
@@ -766,6 +821,197 @@ class Service:
             "affected_verifications": affected,
         }
 
+    # ---- 原料批号并档 ----
+
+    def merge_material_lot(
+        self, source_lot_no: str, target_lot_no: str, reason: str
+    ) -> dict[str, Any]:
+        """并档：同一原料误登记成两个编号时，把源批号并入目标批号。
+
+        - 两号均须已登记且仍可使用（ACTIVE）；目标批号保留自身名称、过敏原与
+          待检锁定状态，一律不动；
+        - 源批号留档可查（status=MERGED，记录并档目标/原因/时间），不再接受
+          新批次引用、更正或锁定操作；
+        - 已有有效批次对源号的直接用料改指目标号（原本同时引用两号的批次去重）；
+          已作废批次的登记、历史裁决、确认、交接、退回记录一律不改写；
+        - 受影响产线从最早引用批次起按序重算并追加裁决版本（trigger=MERGE_LOT）；
+          直接用料批次的出货资格按目标号当前锁定状态更新（资格实际变化才递增）；
+          相关已确认核验单随版本变化转待复核；已发运批次仍按原交接追溯；
+        - 相同编号、未知或已停用批号、空原因均整体拒绝；单事务原子提交，
+          失败回滚，不留下部分引用或版本变更。
+        """
+        source_lot_no = (source_lot_no or "").strip()
+        target_lot_no = (target_lot_no or "").strip()
+        reason = (reason or "").strip()
+        if not source_lot_no:
+            raise bad_request("INVALID_PAYLOAD", "源批号不能为空：并档必须指定源批号")
+        if not target_lot_no:
+            raise bad_request("INVALID_PAYLOAD", "target_lot_no 不能为空：并档必须指定目标批号")
+        if not reason:
+            raise bad_request("INVALID_PAYLOAD", "reason 不能为空：原料批号并档必须填写原因")
+        if source_lot_no == target_lot_no:
+            raise conflict(
+                "SAME_SOURCE_TARGET_LOT",
+                f"源批号与目标批号相同: {source_lot_no}，无需并档",
+                [{"source_lot_no": source_lot_no, "target_lot_no": target_lot_no}],
+            )
+        with self.store.write() as conn:
+            source = conn.execute(
+                "SELECT * FROM material_lot WHERE lot_no = ?", (source_lot_no,)
+            ).fetchone()
+            if not source:
+                raise not_found(
+                    "MATERIAL_LOT_NOT_FOUND", f"源原料批号不存在: {source_lot_no}"
+                )
+            target = conn.execute(
+                "SELECT * FROM material_lot WHERE lot_no = ?", (target_lot_no,)
+            ).fetchone()
+            if not target:
+                raise not_found(
+                    "MATERIAL_LOT_NOT_FOUND", f"目标原料批号不存在: {target_lot_no}"
+                )
+            if source["status"] == "MERGED":
+                raise conflict(
+                    "MATERIAL_LOT_MERGED",
+                    f"源批号已并档停用，不能再次并档: {source_lot_no}"
+                    f"（已并入 {source['merged_into']}；留档可查）",
+                )
+            if target["status"] == "MERGED":
+                raise conflict(
+                    "MATERIAL_LOT_MERGED",
+                    f"目标批号已并档停用，不能作为并档目标: {target_lot_no}"
+                    f"（已并入 {target['merged_into']}；留档可查）",
+                )
+
+            # 引用源批号的有效批次（已作废批次不改写，其登记与历史冻结保留）
+            refs = conn.execute(
+                """SELECT b.batch_no AS batch_no, b.line_id AS line_id, b.seq AS seq,
+                          b.material_lots AS material_lots
+                   FROM batch_material bm JOIN batch b ON b.batch_no = bm.batch_no
+                   WHERE bm.lot_no = ? AND b.status = 'ACTIVE'
+                   ORDER BY b.line_id, b.seq""",
+                (source_lot_no,),
+            ).fetchall()
+
+            now = _now()
+            redirected: list[dict[str, Any]] = []
+            for r in refs:
+                old_lots = loads(r["material_lots"])
+                new_lots = _merge_lot_list(old_lots, source_lot_no, target_lot_no)
+                conn.execute(
+                    "UPDATE batch SET material_lots=? WHERE batch_no=?",
+                    (dumps(new_lots), r["batch_no"]),
+                )
+                conn.execute(
+                    "DELETE FROM batch_material WHERE batch_no=? AND lot_no=?",
+                    (r["batch_no"], source_lot_no),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO batch_material(batch_no, lot_no) VALUES (?, ?)",
+                    (r["batch_no"], target_lot_no),
+                )
+                redirected.append(
+                    {
+                        "batch_no": r["batch_no"],
+                        "line_id": r["line_id"],
+                        "seq": r["seq"],
+                        "from_material_lots": old_lots,
+                        "to_material_lots": new_lots,
+                        # 原本同时引用源号与目标号：并档后只保留一个目标号引用
+                        "deduplicated": target_lot_no in old_lots,
+                    }
+                )
+
+            # 源批号留档停用：名称/过敏原/锁定历史保留可查，不再接受新引用与操作
+            conn.execute(
+                """UPDATE material_lot
+                   SET status='MERGED', merged_into=?, merged_reason=?, merged_at=?, updated_at=?
+                   WHERE lot_no=?""",
+                (target_lot_no, reason, now, now, source_lot_no),
+            )
+            cur = conn.execute(
+                """INSERT INTO material_lot_merge(source_lot_no, target_lot_no, reason, merged_at)
+                   VALUES (?, ?, ?, ?)""",
+                (source_lot_no, target_lot_no, reason, now),
+            )
+            merge_id = cur.lastrowid
+
+            # 受影响产线各自从最早引用批次起按序重算（作废批次不参与、不构成起点）
+            starts: dict[str, int] = {}
+            for r in refs:
+                starts[r["line_id"]] = min(starts.get(r["line_id"], r["seq"]), r["seq"])
+            recomputed: list[dict[str, Any]] = []
+            for line_id in sorted(starts):
+                recomputed.extend(
+                    recompute_from(conn, line_id, starts[line_id], "MERGE_LOT")
+                )
+
+            # 直接用料改指目标号：出货资格按目标号当前锁定状态更新，
+            # 资格实际变化才递增版本并联动已确认核验单。
+            ship_changes: list[dict[str, Any]] = []
+            for r in refs:
+                state, changed = _advance_shipment(conn, r["batch_no"], "MERGE_LOT")
+                if changed:
+                    ship = _get_shipment(conn, r["batch_no"])
+                    ship_changes.append(
+                        {
+                            "batch_no": r["batch_no"],
+                            "line_id": r["line_id"],
+                            "seq": r["seq"],
+                            "version": ship["version"],
+                            "status": state["status"],
+                            "locked_lots": state["locked_lots"],
+                        }
+                    )
+            if ship_changes:
+                _flip_confirmed_verifications(
+                    conn, [c["batch_no"] for c in ship_changes]
+                )
+
+            affected = _affected_verifications(
+                conn,
+                sorted(
+                    {s["batch_no"] for s in recomputed}
+                    | {c["batch_no"] for c in ship_changes}
+                ),
+            )
+            source_payload = _material_lot_payload(
+                conn,
+                conn.execute(
+                    "SELECT * FROM material_lot WHERE lot_no = ?", (source_lot_no,)
+                ).fetchone(),
+            )
+            target_payload = _material_lot_payload(
+                conn,
+                conn.execute(
+                    "SELECT * FROM material_lot WHERE lot_no = ?", (target_lot_no,)
+                ).fetchone(),
+            )
+
+        return {
+            "merge": {
+                "merge_id": merge_id,
+                "source_lot_no": source_lot_no,
+                "target_lot_no": target_lot_no,
+                "reason": reason,
+                "merged_at": now,
+            },
+            "source_lot": source_payload,
+            "target_lot": target_payload,
+            "redirected_batches": redirected,
+            "recomputed": recomputed,
+            "shipment_eligibility": ship_changes,
+            "affected_verifications": affected,
+        }
+
+    def list_material_lot_merges(self) -> list[dict[str, Any]]:
+        """列出全部并档记录（只追加，按并档先后排序）。"""
+        with self.store.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM material_lot_merge ORDER BY id"
+            ).fetchall()
+            return [_lot_merge_payload(r) for r in rows]
+
     # ---- 原料批号待检锁定 ----
 
     def set_material_lot_lock(
@@ -787,10 +1033,17 @@ class Service:
             )
         with self.store.write() as conn:
             lot = conn.execute(
-                "SELECT lot_no FROM material_lot WHERE lot_no = ?", (lot_no,)
+                "SELECT lot_no, status, merged_into FROM material_lot WHERE lot_no = ?",
+                (lot_no,),
             ).fetchone()
             if not lot:
                 raise not_found("MATERIAL_LOT_NOT_FOUND", f"原料批号不存在: {lot_no}")
+            if lot["status"] == "MERGED":
+                raise conflict(
+                    "MATERIAL_LOT_MERGED",
+                    f"原料批号已并档停用，不再接受锁定/解除操作: {lot_no}"
+                    f"（已并入 {lot['merged_into']}；留档可查）",
+                )
 
             row = conn.execute(
                 "SELECT * FROM material_lot_lock WHERE lot_no = ?", (lot_no,)
@@ -896,21 +1149,8 @@ class Service:
             if conn.execute("SELECT 1 FROM batch WHERE batch_no = ?", (batch_no,)).fetchone():
                 raise conflict("DUPLICATE_BATCH", f"批次号重复: {batch_no}")
 
-            # 未知原料批号：必须先登记原料批号档案
-            if lots:
-                placeholders = ",".join("?" * len(lots))
-                known = {
-                    r["lot_no"]
-                    for r in conn.execute(
-                        f"SELECT lot_no FROM material_lot WHERE lot_no IN ({placeholders})",
-                        lots,
-                    ).fetchall()
-                }
-                unknown = [l for l in lots if l not in known]
-                if unknown:
-                    raise bad_request(
-                        "UNKNOWN_MATERIAL_LOT", f"未知原料批号: {', '.join(unknown)}"
-                    )
+            # 未知原料批号：必须先登记原料批号档案；已并档停用批号不再接受新批次引用
+            _reject_unusable_lots(conn, lots)
 
             now = _now()
             conn.execute(
@@ -996,18 +1236,8 @@ class Service:
                 else loads(row["cleaned"])
             )
 
-            if new_lots:
-                placeholders = ",".join("?" * len(new_lots))
-                known = {
-                    r["lot_no"]
-                    for r in conn.execute(
-                        f"SELECT lot_no FROM material_lot WHERE lot_no IN ({placeholders})",
-                        new_lots,
-                    ).fetchall()
-                }
-                unknown = [l for l in new_lots if l not in known]
-                if unknown:
-                    raise bad_request("UNKNOWN_MATERIAL_LOT", f"未知原料批号: {', '.join(unknown)}")
+            # 更正用料同样不得引用未登记或已并档停用的批号
+            _reject_unusable_lots(conn, new_lots)
 
             conn.execute(
                 "UPDATE batch SET material_lots=?, declared=?, cleaned=? WHERE batch_no=?",
@@ -2730,6 +2960,7 @@ _TRIGGER_LABELS = {
     "CORRECT_LOT": "原料批号更正重算",
     "VOID_BATCH": "同线批次作废后按序重算",
     "MOVE_BATCH": "批次误归产线更正换线后按序重算",
+    "MERGE_LOT": "原料批号并档改指目标批号后按序重算",
     "LOT_LOCK": "原料批号待检锁定",
     "LOT_UNLOCK": "原料批号解除待检锁定",
     "UPGRADE_INIT": "旧库升级初始资格",
@@ -2738,6 +2969,7 @@ _TRIGGER_LABELS = {
 _SHIP_TRIGGER_LABELS = {
     "REGISTER": "登记批次时确定出货资格",
     "CORRECT_BATCH": "批次用料更正重算出货资格",
+    "MERGE_LOT": "原料批号并档改指目标批号",
     "LOT_LOCK": "原料批号待检锁定",
     "LOT_UNLOCK": "原料批号解除待检锁定",
     "UPGRADE_INIT": "旧库升级初始资格",
@@ -2756,12 +2988,30 @@ def _material_lot_payload(conn, row) -> dict[str, Any]:
     lock = conn.execute(
         "SELECT * FROM material_lot_lock WHERE lot_no = ?", (row["lot_no"],)
     ).fetchone()
+    merged = row["status"] == "MERGED"
     return {
         "lot_no": row["lot_no"],
         "material": row["material"],
         "allergens": loads(row["allergens"]),
+        # ACTIVE=可使用 / MERGED=已并档停用（留档可查，不再接受新引用/更正/锁定）
+        "status": row["status"],
+        "merged": merged,
+        "merged_into": row["merged_into"],
+        "merged_reason": row["merged_reason"],
+        "merged_at": row["merged_at"],
         "updated_at": row["updated_at"],
         "lock": _lock_state_payload(lock),
+    }
+
+
+def _lot_merge_payload(row) -> dict[str, Any]:
+    """material_lot_merge 行 -> 并档记录负载（只追加、不可变）。"""
+    return {
+        "merge_id": row["id"],
+        "source_lot_no": row["source_lot_no"],
+        "target_lot_no": row["target_lot_no"],
+        "reason": row["reason"],
+        "merged_at": row["merged_at"],
     }
 
 
